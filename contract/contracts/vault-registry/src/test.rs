@@ -11528,3 +11528,6 @@ include!("test/storage_ttl_mutations.rs");
 include!("test/payment_pause_matrix.rs");
 include!("test/batch_owner_and_ordered_reads.rs");
 include!("test/resale_royalty.rs");
+include!("test/verifier_rotation.rs");
+include!("test/attestation_hash_memoization.rs");
+include!("test/scheduled_pause.rs");
