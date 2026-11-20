@@ -129,11 +129,11 @@ import {
 } from "./profiles.js";
 import {
   buildPublishStatusSnapshot,
+  fetchPublishStatusPair,
   normalizeIntervalMs,
   normalizeTimeoutMs,
   normalizeWaitFlag,
   pollPublishStatus,
-  publishStatusFromResponses,
   type PublishProgressReporter,
   type PublishStatusFetch,
 } from "./publishStatus.js";
@@ -264,8 +264,8 @@ import {
   type CatalogFallbackReason,
   getCatalogSnapshot,
   getPreviewSnapshot,
-  recordCatalogSnapshot,
   recordPreviewSnapshot,
+  revalidateCatalogCache,
 } from "./catalogCache.js";
 import { resolveCacheBypass, withBypassNotice } from "./catalogCacheBypass.js";
 import { buildCatalogCacheScope, setCatalogCacheScopeProvider } from "./catalogCacheScope.js";
@@ -717,11 +717,32 @@ async function registryHealth(): Promise<string> {
 export async function prewarmCatalogCache(): Promise<string> {
   const startedAt = Date.now();
   try {
-    await browseOutcome({});
+    const url = `${BASE_URL}/resources`;
+    const result = await revalidateCatalogCache({
+      fetcher: () => rawJsonFetchOnce(url),
+      policy: RETRY_POLICY,
+      label: "GET /resources",
+      onRetry: logRetry,
+    });
+    if (!result.revalidated) {
+      if (result.error !== undefined) {
+        const source = sourceForUrl(url);
+        throw mcpError(
+          mapTransportError({ operation: SERVICE_OPERATION[source], source, error: result.error }),
+        );
+      }
+      const res = result.response!;
+      throw mcpError(
+        mapHttpError({
+          operation: "Catalog pre-warm failed",
+          source: "api",
+          status: res.status,
+          data: res.data,
+        }),
+      );
+    }
     const elapsedMs = Date.now() - startedAt;
-    const snapshot = getCatalogSnapshot();
-    const count = snapshot && Array.isArray(snapshot.resources) ? snapshot.resources.length : 0;
-    return `Catalog pre-warmed: ${count} resource(s) cached in ${elapsedMs}ms.`;
+    return `Catalog pre-warmed: ${result.resources.length} resource(s) cached in ${elapsedMs}ms.`;
   } catch (err) {
     return `Catalog pre-warm failed: ${safeErrorMessage(err)}`;
   }
@@ -952,6 +973,41 @@ const SERVICE_OPERATION: Record<ErrorSource, string> = {
   registry: "Registry request failed",
 };
 
+async function parseApiResponse(res: Response): Promise<ApiResponse<any>> {
+  const responseHeaders: Record<string, string> = {};
+  res.headers.forEach((value, key) => {
+    responseHeaders[key.toLowerCase()] = value;
+  });
+  const text = await res.text();
+  try {
+    return { ok: res.ok, status: res.status, data: JSON.parse(text), headers: responseHeaders };
+  } catch {
+    return { ok: res.ok, status: res.status, data: text, headers: responseHeaders };
+  }
+}
+
+/** Single-attempt JSON fetch throwing raw transport errors for callers managing retry (e.g. catalog revalidation). */
+async function rawJsonFetchOnce(url: string, init?: RequestInit): Promise<ApiResponse<any>> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const body =
+    typeof init?.body === "string" ? init.body : init?.body ? JSON.stringify(init.body) : undefined;
+  const baseHeaders: Record<string, string> = {
+    "Content-Type": "application/json",
+    "User-Agent": USER_AGENT,
+    ...correlationHeaders(init?.headers as Record<string, string> | undefined),
+  };
+  const headers = signMutatingHeaders(url, method, baseHeaders, body);
+  const service = timeoutServiceForUrl(url);
+  const res = await fetchWithTimeout(
+    httpFetch,
+    url,
+    { ...init, method, body: body ?? init?.body, headers },
+    service,
+    TIMEOUTS[service],
+  );
+  return parseApiResponse(res);
+}
+
 async function jsonFetch(url: string, init?: RequestInit): Promise<ApiResponse<any>> {
   const method = (init?.method ?? "GET").toUpperCase();
   const body =
@@ -982,16 +1038,7 @@ async function jsonFetch(url: string, init?: RequestInit): Promise<ApiResponse<a
     throw mcpError(mapTransportError({ operation: SERVICE_OPERATION[source], source, error: err }));
   }
 
-  const responseHeaders: Record<string, string> = {};
-  res.headers.forEach((value, key) => {
-    responseHeaders[key.toLowerCase()] = value;
-  });
-  const text = await res.text();
-  try {
-    return { ok: res.ok, status: res.status, data: JSON.parse(text), headers: responseHeaders };
-  } catch {
-    return { ok: res.ok, status: res.status, data: text, headers: responseHeaders };
-  }
+  return parseApiResponse(res);
 }
 
 function requireWallet(): AgentWallet {
@@ -2125,6 +2172,56 @@ function catalogSnapshotFor(err: unknown): { resources: unknown[]; notice: strin
   };
 }
 
+/**
+ * Revalidate a catalog GET under bounded retry/backoff and fall back to the
+ * offline snapshot only after retries are exhausted on a retryable gateway or
+ * transport failure (#220, #837).
+ */
+async function fetchCatalogWithRevalidation(
+  url: string,
+  operation: string,
+  bypassCache: boolean,
+): Promise<{ raw: any[]; notice: string | null }> {
+  const result = await revalidateCatalogCache({
+    fetcher: () => rawJsonFetchOnce(url),
+    policy: RETRY_POLICY,
+    label: `GET ${new URL(url).pathname}`,
+    onRetry: logRetry,
+  });
+
+  if (result.revalidated) {
+    return {
+      raw: result.resources,
+      notice: withBypassNotice(cacheStalenessNotice(result.response.headers), bypassCache),
+    };
+  }
+
+  if (result.error !== undefined) {
+    const source = sourceForUrl(url);
+    const err = mcpError(
+      mapTransportError({ operation: SERVICE_OPERATION[source], source, error: result.error }),
+    );
+    const fallback = bypassCache ? null : catalogSnapshotFor(err);
+    if (!fallback) throw err;
+    return {
+      raw: Array.isArray(fallback.resources) ? (fallback.resources as any[]) : [],
+      notice: fallback.notice,
+    };
+  }
+
+  const res = result.response!;
+  const err = mcpError(
+    mapHttpError({ operation, source: "api", status: res.status, data: res.data }),
+  );
+  if (!bypassCache && result.snapshot && result.reason) {
+    return {
+      raw: Array.isArray(result.snapshot.resources) ? (result.snapshot.resources as any[]) : [],
+      notice: catalogCacheLabel(result.snapshot.savedAtMs, Date.now(), result.reason),
+    };
+  }
+  throw err;
+}
+
 async function browseOutcome(
   filters: CatalogFilters = {},
   bypassCache = false,
@@ -2134,29 +2231,7 @@ async function browseOutcome(
   filters = resumed.filters;
   const qs = buildCatalogQueryString(filters);
   const url = qs ? `${BASE_URL}/resources?${qs}` : `${BASE_URL}/resources`;
-  let raw: any[] = [];
-  let notice: string | null = null;
-  try {
-    const res = await jsonFetch(url);
-    if (!res.ok) {
-      throw mcpError(
-        mapHttpError({
-          operation: "Browse failed",
-          source: "api",
-          status: res.status,
-          data: res.data,
-        }),
-      );
-    }
-    raw = Array.isArray(res.data) ? res.data : [];
-    recordCatalogSnapshot(raw);
-    notice = withBypassNotice(cacheStalenessNotice(res.headers), bypassCache);
-  } catch (err) {
-    const fallback = bypassCache ? null : catalogSnapshotFor(err);
-    if (!fallback) throw err;
-    raw = Array.isArray(fallback.resources) ? (fallback.resources as any[]) : [];
-    notice = fallback.notice;
-  }
+  const { raw, notice } = await fetchCatalogWithRevalidation(url, "Browse failed", bypassCache);
   const items: any[] = applyCatalogSort(applyClientCatalogFilters(raw, filters), filters.sort);
   const body =
     items.length === 0
@@ -2207,29 +2282,7 @@ async function searchOutcome(
 
   const qs = buildCatalogQueryString(filters);
   const url = qs ? `${BASE_URL}/resources?${qs}` : `${BASE_URL}/resources`;
-  let raw: any[] = [];
-  let notice: string | null = null;
-  try {
-    const res = await jsonFetch(url);
-    if (!res.ok) {
-      throw mcpError(
-        mapHttpError({
-          operation: "Search failed",
-          source: "api",
-          status: res.status,
-          data: res.data,
-        }),
-      );
-    }
-    raw = Array.isArray(res.data) ? res.data : [];
-    recordCatalogSnapshot(raw);
-    notice = withBypassNotice(cacheStalenessNotice(res.headers), bypassCache);
-  } catch (err) {
-    const fallback = bypassCache ? null : catalogSnapshotFor(err);
-    if (!fallback) throw err;
-    raw = Array.isArray(fallback.resources) ? (fallback.resources as any[]) : [];
-    notice = fallback.notice;
-  }
+  const { raw, notice } = await fetchCatalogWithRevalidation(url, "Search failed", bypassCache);
 
   // Client-side keyword / tags / listed / skipped for unit-test compatibility
   // and parity with fields the public catalog schema does not accept.
@@ -2295,9 +2348,11 @@ export async function preview(resourceId: string, bypassCache = false): Promise<
 }
 
 async function fetchPublishStatusData(resourceId: string): Promise<PublishStatusFetch> {
-  const metaRes = await jsonFetch(`${BASE_URL}/resources/${resourceId}/meta`);
-  const verRes = await jsonFetch(`${BASE_URL}/resources/${resourceId}/verification`);
-  return publishStatusFromResponses(resourceId, metaRes, verRes);
+  return fetchPublishStatusPair(
+    resourceId,
+    () => jsonFetch(`${BASE_URL}/resources/${resourceId}/meta`),
+    () => jsonFetch(`${BASE_URL}/resources/${resourceId}/verification`),
+  );
 }
 
 function sleepMs(ms: number): Promise<void> {
