@@ -108,6 +108,9 @@ pub const TOP_TAGS_CAP: u32 = 20;
 /// via `register_batch`. Keeps execution bounded and prevents transaction
 /// timeouts.
 pub const MAX_BATCH_REGISTER: u32 = 10;
+/// Maximum number of IDs accepted by a single batch read (`get_many`,
+/// `get_many_ordered`, `get_owner_many`). Matches `MAX_STATE_BATCH`.
+pub const MAX_BATCH_READ: u32 = 20;
 /// Maximum number of prices that can be updated in one `set_price_many` call.
 pub const MAX_BATCH_PRICE_UPDATES: u32 = 10;
 /// Maximum number of ids accepted by a single `repair_index_chunk` call, so
@@ -183,6 +186,10 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("set_royalty_recipient", "creator"),
     ("set_royalties_disabled", "creator"),
     ("royalties_disabled", "—"),
+    ("set_resale_royalty", "original creator"),
+    ("get_resale_royalty", "—"),
+    ("preview_resale_royalty", "—"),
+    ("get_resale_royalty_summary", "—"),
     ("set_listed", "creator"),
     ("delist", "creator"),
     ("freeze_resource", "creator"),
@@ -200,6 +207,7 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("get", "—"),
     ("get_resource_state", "—"),
     ("get_many", "—"),
+    ("get_many_ordered", "—"),
     ("get_resource_states", "—"),
     ("exists", "—"),
     ("exists_many", "—"),
@@ -388,7 +396,7 @@ pub const ERROR_SCHEMA: &[(u32, &str, &str)] = &[
     (34, "FeeBpsTooHigh", "A fee or fee-destination basis-point value exceeds its configured ceiling."),
     (35, "TotalFeeTooHigh", "The combined fee policy or fee-destination split is invalid."),
     (36, "CountOverflow", "The global resource count would overflow `u32`."),
-    (37, "BatchTooLarge", "`get_many` or `get_owner_many` received more than 20 ids, or `repair_index_chunk` received more than `REPAIR_INDEX_CHUNK_CAP` (50) ids."),
+    (37, "BatchTooLarge", "`get_many`, `get_many_ordered`, or `get_owner_many` received more than 20 ids, or `repair_index_chunk` received more than `REPAIR_INDEX_CHUNK_CAP` (50) ids."),
     (38, "DuplicateReceipt", "A purchase receipt is already anchored for `(resource_id, buyer)`."),
     (39, "FlagReasonHashTooLong", "`reason_hash` in `set_flag_reason_hash` exceeds `MAX_FLAG_REASON_HASH_LEN` (64 bytes)."),
     (40, "ContractPaused", "A state-changing method was called while the registry is paused."),
@@ -433,6 +441,14 @@ pub const EVENT_SCHEMA: &[(&str, &str)] = &[
         "(prev_tags: Vec<String>, next_tags: Vec<String>)",
     ),
     ("setroyal", "(old_recipient: Option<Address>, new_recipient: Option<Address>)"),
+    (
+        "setresroy",
+        "ResaleRoyaltyUpdated { id, original_creator, old_bps, new_bps, recipient }",
+    ),
+    (
+        "resaleroy",
+        "ResaleRoyaltyCaptured { id, from, to, recipient, basis_amount, royalty_bps, royalty_amount, ledger }",
+    ),
     ("transfer", "(previous_owner: Address, new_owner: Address)"),
     ("propose", "(owner: Address, proposed: Address)"),
     ("cancel", "owner: Address"),
@@ -749,6 +765,21 @@ pub struct BatchPriceUpdate {
     pub new_price: i128,
 }
 
+/// One typed positional entry returned by [`VaultRegistry::get_many_ordered`].
+///
+/// Pairs each requested `id` with `Some(Resource)` when registered or `None`
+/// when absent, preserving exact input ID ordering (including duplicates) so
+/// callers can consume results without re-ordering a map or zipping parallel
+/// vectors.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceBatchItem {
+    /// Requested resource ID (echoed in input order).
+    pub id: String,
+    /// Stored resource record when present, or `None` when absent.
+    pub resource: Option<Resource>,
+}
+
 /// Result of a batch registration attempt. Contains successfully registered
 /// resource IDs and any errors encountered (with their indices).
 #[contracttype]
@@ -1015,6 +1046,15 @@ pub enum AuxKey {
     PaymentsPaused,
     /// Per-resource creator opt-out from future royalty routing. Value type: `bool`.
     RoyaltiesDisabled(String),
+    /// Original creator locked on first resale-royalty opt-in or first
+    /// ownership transfer. Value type: `Address`.
+    OriginalCreator(String),
+    /// Creator opt-in resale royalty configuration for a resource. Value type:
+    /// `ResaleRoyaltyConfig`.
+    ResaleRoyalty(String),
+    /// Cumulative resale royalty capture audit summary for a resource. Value
+    /// type: `ResaleRoyaltySummary`.
+    ResaleRoyaltySummary(String),
 }
 
 /// Payload of every role grant/revoke event (`addverif`/`rmverif`,
@@ -1434,6 +1474,11 @@ pub use batch_state_reads::MAX_STATE_BATCH;
 mod fee_split_preview;
 pub use fee_split_preview::FeeSplitPreview;
 mod recovery_target_check;
+mod resale_royalty;
+pub use resale_royalty::{
+    ResaleRoyaltyCaptured, ResaleRoyaltyConfig, ResaleRoyaltyPreview, ResaleRoyaltySummary,
+    ResaleRoyaltyUpdated, MAX_RESALE_ROYALTY_BPS,
+};
 mod role_inventory;
 pub use role_inventory::{RoleKind, RolePage, MAX_ROLE_MEMBERS, ROLE_PAGE_CAP};
 
@@ -2173,6 +2218,46 @@ impl VaultRegistry {
         Ok(Self::royalty_opt_out(&env, &id))
     }
 
+    /// Opt into, update, or clear (`royalty_bps == 0`) a capped resale royalty
+    /// (transfer fee) payable to the original creator (or `recipient`) on
+    /// secondary ownership transfers.
+    ///
+    /// Bounded by [`MAX_RESALE_ROYALTY_BPS`] (1,000 bp = 10 %); higher values
+    /// fail with [`Error::FeeBpsTooHigh`]. Only the original creator while
+    /// still owning the resource may configure or modify this setting; once
+    /// ownership transfers away, terms are locked (`Error::Unauthorized`).
+    /// Emits `setresroy`.
+    pub fn set_resale_royalty(
+        env: Env,
+        id: String,
+        royalty_bps: u32,
+        recipient: Option<Address>,
+    ) -> Result<(), Error> {
+        resale_royalty::set(&env, id, royalty_bps, recipient)
+    }
+
+    /// Read a resource's opt-in resale royalty configuration, or `None` when
+    /// the original creator has not opted in.
+    pub fn get_resale_royalty(env: Env, id: String) -> Result<Option<ResaleRoyaltyConfig>, Error> {
+        resale_royalty::get(&env, id)
+    }
+
+    /// Preview the exact integer floor resale royalty for `id` against
+    /// `sale_amount` (or `resource.price` when `sale_amount` is `None`).
+    pub fn preview_resale_royalty(
+        env: Env,
+        id: String,
+        sale_amount: Option<i128>,
+    ) -> Result<ResaleRoyaltyPreview, Error> {
+        resale_royalty::preview(&env, id, sale_amount)
+    }
+
+    /// Read the cumulative resale royalty capture summary for `id`. Returns
+    /// zero counters when no royalty-bearing secondary transfer has occurred.
+    pub fn get_resale_royalty_summary(env: Env, id: String) -> Result<ResaleRoyaltySummary, Error> {
+        resale_royalty::summary(&env, id)
+    }
+
     pub fn transfer_ownership(env: Env, id: String, new_creator: Address) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         Self::validate_resource_id(&id)?;
@@ -2183,6 +2268,7 @@ impl VaultRegistry {
             return Err(Error::AlreadyOwner);
         }
         let previous_owner = resource.creator.clone();
+        let basis_price = resource.price;
         resource.creator = new_creator.clone();
         Self::save(&env, &mut resource);
         Self::move_creator_index(&env, &previous_owner, &new_creator, &id, resource.listed);
@@ -2193,8 +2279,15 @@ impl VaultRegistry {
         }
 
         env.events().publish(
-            (symbol_short!("transfer"), id),
-            (previous_owner, new_creator),
+            (symbol_short!("transfer"), id.clone()),
+            (previous_owner.clone(), new_creator.clone()),
+        );
+        resale_royalty::on_ownership_transfer(
+            &env,
+            &id,
+            &previous_owner,
+            &new_creator,
+            basis_price,
         );
         Ok(())
     }
@@ -2232,6 +2325,7 @@ impl VaultRegistry {
         let mut resource = Self::load(&env, &id)?;
         Self::ensure_mutable(&resource)?;
         let previous_owner = resource.creator.clone();
+        let basis_price = resource.price;
         resource.creator = pending_owner.clone();
 
         // Clear dispute flag on ownership transfer - disputes are tied to the
@@ -2244,8 +2338,15 @@ impl VaultRegistry {
         env.storage().persistent().remove(&key);
 
         env.events().publish(
-            (symbol_short!("transfer"), id),
-            (previous_owner, pending_owner),
+            (symbol_short!("transfer"), id.clone()),
+            (previous_owner.clone(), pending_owner.clone()),
+        );
+        resale_royalty::on_ownership_transfer(
+            &env,
+            &id,
+            &previous_owner,
+            &pending_owner,
+            basis_price,
         );
         Ok(())
     }
@@ -2959,23 +3060,60 @@ impl VaultRegistry {
 
     /// Read several resources in one invocation, preserving input order.
     /// Missing resources are represented by `None`; valid resources are
-    /// returned as `Some(Resource)`. The batch is capped to bound execution
-    /// and response size.
+    /// returned as `Some(Resource)`. The batch is capped at [`MAX_BATCH_READ`]
+    /// (20) IDs to bound execution and response size.
     pub fn get_many(env: Env, ids: Vec<String>) -> Result<Vec<Option<Resource>>, Error> {
-        const MAX_BATCH_SIZE: u32 = 20;
-        if ids.len() > MAX_BATCH_SIZE {
+        if ids.len() > MAX_BATCH_READ {
             return Err(Error::BatchTooLarge);
+        }
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            Self::validate_resource_id(&id)?;
         }
         let mut result: Vec<Option<Resource>> = Vec::new(&env);
         for i in 0..ids.len() {
             let id = ids.get(i).unwrap();
-            Self::validate_resource_id(&id)?;
             let key = DataKey::Resource(id);
             let resource = env.storage().persistent().get(&key);
             if resource.is_some() {
                 Self::bump_persistent(&env, &key);
             }
             result.push_back(resource);
+        }
+        Ok(result)
+    }
+
+    /// Read several resources in one invocation, returning typed
+    /// [`ResourceBatchItem`] entries in exact input ID order.
+    ///
+    /// Unlike `get_many` (which returns positional `Option<Resource>` slots),
+    /// each element pairs the requested `id` with its looked-up `resource`
+    /// (`Some(Resource)` or `None`), preserving duplicates and ordering so
+    /// clients do not need to re-order a map or zip parallel vectors.
+    ///
+    /// Capped at [`MAX_BATCH_READ`] (20) IDs (`Error::BatchTooLarge`). Any
+    /// invalid ID fails the whole call with `Error::InvalidResourceId` before
+    /// reading storage. Bumps persistent TTL for each found resource.
+    pub fn get_many_ordered(
+        env: Env,
+        ids: Vec<String>,
+    ) -> Result<Vec<ResourceBatchItem>, Error> {
+        if ids.len() > MAX_BATCH_READ {
+            return Err(Error::BatchTooLarge);
+        }
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            Self::validate_resource_id(&id)?;
+        }
+        let mut result: Vec<ResourceBatchItem> = Vec::new(&env);
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            let key = DataKey::Resource(id.clone());
+            let resource: Option<Resource> = env.storage().persistent().get(&key);
+            if resource.is_some() {
+                Self::bump_persistent(&env, &key);
+            }
+            result.push_back(ResourceBatchItem { id, resource });
         }
         Ok(result)
     }
@@ -3026,17 +3164,20 @@ impl VaultRegistry {
     }
 
     /// Batch owner lookup. Returns a `Vec<Option<Address>>` parallel to `ids`.
-    /// Missing resources are `None`; invalid resource ids fail the whole call,
-    /// matching `get_many` and keeping malformed multi-select requests visible.
+    /// Missing resources are `None`; invalid resource ids fail the whole call
+    /// before reading storage, matching `get_many` and keeping malformed
+    /// multi-select requests visible. Capped at [`MAX_BATCH_READ`] (20) IDs.
     pub fn get_owner_many(env: Env, ids: Vec<String>) -> Result<Vec<Option<Address>>, Error> {
-        const MAX_BATCH_SIZE: u32 = 20;
-        if ids.len() > MAX_BATCH_SIZE {
+        if ids.len() > MAX_BATCH_READ {
             return Err(Error::BatchTooLarge);
+        }
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            Self::validate_resource_id(&id)?;
         }
         let mut result: Vec<Option<Address>> = Vec::new(&env);
         for i in 0..ids.len() {
             let id = ids.get(i).unwrap();
-            Self::validate_resource_id(&id)?;
             let key = DataKey::Resource(id);
             let resource: Option<Resource> = env.storage().persistent().get(&key);
             if resource.is_some() {
@@ -5462,6 +5603,7 @@ impl VaultRegistry {
         }
 
         let previous_owner = resource.creator.clone();
+        let basis_price = resource.price;
         resource.creator = new_creator.clone();
         Self::save(&env, &mut resource);
         Self::move_creator_index(&env, &previous_owner, &new_creator, &id, resource.listed);
@@ -5498,6 +5640,14 @@ impl VaultRegistry {
         env.events().publish(
             (symbol_short!("transfer"), id.clone()),
             (previous_owner.clone(), new_creator.clone()),
+        );
+
+        resale_royalty::on_ownership_transfer(
+            &env,
+            &id,
+            &previous_owner,
+            &new_creator,
+            basis_price,
         );
 
         // Emit the terms-aware event for callers that need the full context.

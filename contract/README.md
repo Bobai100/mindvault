@@ -1410,3 +1410,9 @@ for the original architecture spike. The pause feature is now implemented — se
 - Tag-based discovery (`list_by_tag`) — see
   [`docs/tag-index-repair-design.md`](../docs/tag-index-repair-design.md) for
   the repair contract an on-chain tag index must satisfy before it ships.
+
+### Batch Reads and Resale Royalties (#232, #233, #236, #239)
+- `get_owner_many(ids)`: Batch ownership lookup returning a positional `Vec<Option<Address>>`.
+- `get_many_ordered(ids)`: Typed list-ordered batch resource lookup returning `Vec<ResourceBatchItem>`.
+- `set_resale_royalty(id, royalty_bps, recipient)`: Opt-in creator resale royalty (fee on transfer) capped at 2500 bps (25%).
+- `resource_schema_version()`: Directly query the integer schema version (`RESOURCE_SCHEMA_VERSION = 2`) without decoding version strings.
