@@ -13,9 +13,11 @@
 extern crate alloc;
 
 mod anchor_status;
+mod attestation_hash;
 mod capability_version;
 mod role_events;
 pub use anchor_status::AnchorStatus;
+pub use attestation_hash::TaggedAttestationHash;
 pub use capability_version::ROLE_CAPABILITY_VERSION;
 pub use role_events::RoleRotation;
 
@@ -224,12 +226,14 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("add_verifier", "admin"),
     ("remove_verifier", "admin"),
     ("rotate_verifier", "admin"),
+    ("reset_verifier", "admin"),
     ("is_verifier", "—"),
     ("list_role_members", "—"),
     ("set_verification_status", "verifier"),
     ("revoke_attestation", "verifier"),
     ("get_attestation_reason_hash", "—"),
     ("get_attestation_hash", "—"),
+    ("get_tagged_attestation_hash", "—"),
     ("compute_attestation_hash", "—"),
     ("verify_attestation_hash", "—"),
     ("get_memo_hash", "—"),
@@ -365,7 +369,7 @@ pub const ERROR_SCHEMA: &[(u32, &str, &str)] = &[
     (15, "NoPendingTransfer", "No pending transfer exists for this resource."),
     (16, "ReservedId", "Resource id collides with a reserved word (e.g. `admin`, `registry`)."),
     (17, "PriceExceedsMax", "Price exceeds `MAX_PRICE`."),
-    (18, "AdminNotSet", "`add_verifier`, `remove_verifier`, `rotate_verifier`, or `repair_index` was called before any admin was bootstrapped."),
+    (18, "AdminNotSet", "`add_verifier`, `remove_verifier`, `rotate_verifier`, `reset_verifier`, or `repair_index` was called before any admin was bootstrapped."),
     (19, "NotVerifier", "`set_verification_status` was called by an address that does not hold the verifier role."),
     (20, "InvalidVerificationTransition", "The requested `VerificationStatus` transition is not allowed (e.g. same-status no-op, or reverting to `Pending`)."),
     (21, "AlreadyFrozen", "`freeze_metadata` was called on a resource whose metadata is already frozen."),
@@ -664,6 +668,9 @@ pub struct FlagDetails {
     pub last_moderator: Option<Address>,
 }
 
+/// Audit payload published under topic `verrot` when an admin atomically
+/// replaces a compromised or retiring verifier key via `rotate_verifier` or
+/// `reset_verifier`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VerifierRotation {
@@ -1863,11 +1870,14 @@ impl VaultRegistry {
 
         let hash_key = DataKey::AttestationHash(id.clone());
         let stored_attestation_hash = match attestation_hash {
-            Some(hash) => Some(Self::normalize_attestation_hash(&env, &hash)?),
+            Some(hash) => Some(attestation_hash::normalize_attestation_hash(&env, &hash)?),
             None => None,
         };
         if let Some(hash) = stored_attestation_hash.clone() {
-            env.storage().persistent().set(&hash_key, &hash);
+            let existing: Option<String> = env.storage().persistent().get(&hash_key);
+            if existing.as_ref() != Some(&hash) {
+                env.storage().persistent().set(&hash_key, &hash);
+            }
             Self::bump_persistent(&env, &hash_key);
         } else {
             env.storage().persistent().remove(&hash_key);
@@ -1912,6 +1922,17 @@ impl VaultRegistry {
         hash
     }
 
+    /// Read the memoized attestation hash for a resource parsed into its
+    /// versioned algorithm tag and raw digest.
+    ///
+    /// Legacy untagged receipts default to `version = ATTESTATION_ENCODING_VERSION_V1`
+    /// (`1`) and `algorithm = DEFAULT_ATTESTATION_HASH_ALGORITHM` (`"sha256"`),
+    /// so historical attestations remain readable as verifiers evolve.
+    pub fn get_tagged_attestation_hash(env: Env, id: String) -> Option<TaggedAttestationHash> {
+        let raw = Self::get_attestation_hash(env.clone(), id)?;
+        attestation_hash::parse_tagged_attestation_hash(&env, &raw).ok()
+    }
+
     /// Revoke an existing attestation for a resource with an explicit, bounded reason hash.
     /// Only an authorized verifier may call this. Retains the verifier's status history
     /// without erasing prior records. Emits `attrevk`.
@@ -1935,7 +1956,7 @@ impl VaultRegistry {
             return Err(Error::InvalidVerificationTransition);
         }
 
-        let normalized_reason = Self::normalize_attestation_hash(&env, &reason_hash)?;
+        let normalized_reason = attestation_hash::normalize_attestation_hash(&env, &reason_hash)?;
 
         let reason_key = DataKey::AttestationReasonHash(id.clone());
         env.storage()
@@ -2012,8 +2033,14 @@ impl VaultRegistry {
         String::from_bytes(&env, &out)
     }
 
-    /// Whether the resource is currently in `status` and its stored
-    /// attestation hash equals `compute_attestation_hash(id, status, document_hash)`.
+    /// Whether the resource is currently in `status` and its memoized
+    /// attestation hash matches `compute_attestation_hash(id, status, document_hash)`
+    /// under canonical `(version, algorithm, digest)` comparison.
+    ///
+    /// Legacy untagged receipts stored prior to tagging are interpreted as
+    /// `(version = 1, algorithm = "sha256")` so they continue to verify, while
+    /// hashes tagged with a different algorithm (e.g. `poseidon`) or version
+    /// (e.g. `v2:sha256`) do not collide.
     pub fn verify_attestation_hash(
         env: Env,
         id: String,
@@ -2027,11 +2054,13 @@ impl VaultRegistry {
         if resource.verified != status {
             return false;
         }
-        match Self::get_attestation_hash(env.clone(), id.clone()) {
-            Some(stored) => {
-                stored == Self::compute_attestation_hash(env, id, status, document_hash)
-            }
-            None => false,
+        let Some(stored) = Self::get_tagged_attestation_hash(env.clone(), id.clone()) else {
+            return false;
+        };
+        let expected_raw = Self::compute_attestation_hash(env.clone(), id, status, document_hash);
+        match attestation_hash::parse_tagged_attestation_hash(&env, &expected_raw) {
+            Ok(expected) => stored == expected,
+            Err(_) => false,
         }
     }
 
@@ -3424,8 +3453,20 @@ impl VaultRegistry {
     }
 
     /// The active scheduled pause deadline, if one exists.
-    /// Bumps the instance storage TTL to keep the entry alive for active monitors.
+    ///
+    /// Returns `None` when the contract is not paused, when an indefinite
+    /// pause (`set_paused(admin, true)`) is active without a deadline, or once
+    /// the ledger timestamp reaches or passes the deadline. Bumps the instance
+    /// storage TTL when an active deadline is returned.
     pub fn pause_until(env: Env) -> Option<u64> {
+        let paused = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false);
+        if !paused {
+            return None;
+        }
         let pause_until = env
             .storage()
             .instance()
@@ -3480,6 +3521,16 @@ impl VaultRegistry {
         Ok(())
     }
 
+    /// Atomically replace a compromised or retiring verifier key with a fresh
+    /// replacement key in one audited transaction (#228).
+    ///
+    /// Unlike calling `remove_verifier` followed by `add_verifier`, this flow
+    /// validates both keys upfront (`old_verifier` must be registered,
+    /// `new_verifier` must differ and not already be registered), updates the
+    /// role inventory, and emits `rmverif`, `addverif`, and the `verrot`
+    /// (`VerifierRotation { old_verifier, new_verifier, ledger }`) audit event
+    /// atomically. Allowed while the registry is paused so operators can
+    /// recover from a compromised verifier key during an incident.
     pub fn rotate_verifier(
         env: Env,
         old_verifier: Address,
@@ -3511,6 +3562,20 @@ impl VaultRegistry {
             },
         );
         Ok(())
+    }
+
+    /// Admin recovery entrypoint to reset a compromised verifier key to a
+    /// replacement key atomically (#228).
+    ///
+    /// Delegates to [`Self::rotate_verifier`] so both entrypoints share
+    /// identical validation, role-inventory updates, and `rmverif`/`addverif`/
+    /// `verrot` audit events.
+    pub fn reset_verifier(
+        env: Env,
+        old_verifier: Address,
+        new_verifier: Address,
+    ) -> Result<(), Error> {
+        Self::rotate_verifier(env, old_verifier, new_verifier)
     }
 
     /// Page through the addresses holding `role` (admin, verifier, moderator
@@ -5836,46 +5901,6 @@ impl VaultRegistry {
         }
     }
 
-    fn normalize_attestation_hash(env: &Env, hash: &String) -> Result<String, Error> {
-        let bytes = Self::string_bytes(hash);
-        let mut separator = None;
-        for (idx, byte) in bytes.iter().enumerate() {
-            if *byte == b':' {
-                separator = Some(idx);
-                break;
-            }
-        }
-
-        if let Some(separator) = separator {
-            let algorithm = &bytes[..separator];
-            let digest = &bytes[separator + 1..];
-            if algorithm.is_empty()
-                || algorithm.len() > MAX_ATTESTATION_HASH_ALGORITHM_LEN as usize
-                || digest.is_empty()
-                || digest.len() > MAX_ATTESTATION_HASH_LEN as usize
-            {
-                return Err(Error::AttestationHashTooLong);
-            }
-            for &byte in algorithm {
-                if !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_') {
-                    return Err(Error::AttestationHashTooLong);
-                }
-            }
-            return Ok(hash.clone());
-        }
-
-        if bytes.is_empty() || bytes.len() > MAX_ATTESTATION_HASH_LEN as usize {
-            return Err(Error::AttestationHashTooLong);
-        }
-        let mut tagged = alloc::vec::Vec::with_capacity(
-            DEFAULT_ATTESTATION_HASH_ALGORITHM.len() + 1 + bytes.len(),
-        );
-        tagged.extend_from_slice(DEFAULT_ATTESTATION_HASH_ALGORITHM.as_bytes());
-        tagged.push(b':');
-        tagged.extend_from_slice(&bytes);
-        Ok(String::from_bytes(env, &tagged))
-    }
-
     /// Normalize every tag in the input list to lowercase ASCII, validate
     /// count and length limits, enforce uniqueness in normalized form, and
     /// return the normalized `Vec<String>`.
@@ -6505,16 +6530,28 @@ impl VaultRegistry {
             .publish((symbol_short!("anchor"), resource_id), anchor);
     }
 
-    /// Return `ContractPaused` if the emergency pause flag is set.
+    /// Return `ContractPaused` if the emergency pause flag is active.
     ///
     /// Every write method calls this at its entry point. Read-only methods
     /// never call it, so they remain available while the registry is paused.
+    /// When a scheduled maintenance window (`DataKey::PauseUntil`) has already
+    /// expired, this lazily clears the stale `Paused` and `PauseUntil` entries
+    /// before allowing the write to proceed.
     fn require_not_paused(env: &Env) -> Result<(), Error> {
         if Self::pause_is_active(env) {
-            Err(Error::ContractPaused)
-        } else {
-            Ok(())
+            return Err(Error::ContractPaused);
         }
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            env.storage().instance().set(&DataKey::Paused, &false);
+            env.storage().instance().remove(&DataKey::PauseUntil);
+            Self::bump_instance(env);
+        }
+        Ok(())
     }
 
     /// Return whether the registry is paused after applying any scheduled
