@@ -84,6 +84,7 @@ import {
   _setMockMode,
 } from "./index.js";
 import {
+  getCatalogSnapshot,
   recordCatalogSnapshot,
   recordPreviewSnapshot,
   _clearCatalogCache,
@@ -240,6 +241,34 @@ describe("prewarmCatalogCache", () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network error"));
     const result = await prewarmCatalogCache();
     expect(result).toContain("Catalog pre-warm failed");
+  });
+
+  it("retries transient gateway errors during revalidation and unpins a stale snapshot (#220)", async () => {
+    recordCatalogSnapshot([{ id: "stale-001", title: "Stale Entry", price: "1.00" }], undefined, 1);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(mockResponse({ error: "bad gateway" }, false, 502))
+      .mockResolvedValueOnce(mockResponse(sampleResources));
+
+    const result = await prewarmCatalogCache();
+    expect(result).toContain("Catalog pre-warmed");
+    expect(result).toContain("2 resource(s)");
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(getCatalogSnapshot()?.resources).toEqual(sampleResources);
+  });
+
+  it("reports revalidation failure instead of claiming success from an existing stale snapshot (#220)", async () => {
+    recordCatalogSnapshot([{ id: "stale-001", title: "Stale Entry", price: "1.00" }], undefined, 1);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      mockResponse({ error: "unavailable" }, false, 503),
+    );
+
+    const result = await prewarmCatalogCache();
+    expect(result).toContain("Catalog pre-warm failed");
+    // The existing offline snapshot stays preserved for fallback reads.
+    expect(getCatalogSnapshot()?.resources).toEqual([
+      { id: "stale-001", title: "Stale Entry", price: "1.00" },
+    ]);
   });
 });
 
