@@ -1801,7 +1801,7 @@ async function walletBalancesOutcome(): Promise<ToolOutcome> {
   const spendEstimate = await estimatePendingSpend(activeProfileName);
   const activeWallet = agents.find((row) => row.profile === activeProfileName);
   const configuredAutoPayCeilingUsdc =
-    process.env.MINDVAULT_MAX_AUTO_PAY_USDC ?? DEFAULT_MAX_AUTO_PAY_USDC;
+    process.env.MINDVAULT_MAX_AUTO_PAY_USDC?.trim() || DEFAULT_MAX_AUTO_PAY_USDC;
 
   const usdcTotal = sumBalances(
     [...agents, ...(platform ? [platform] : [])]
@@ -2618,9 +2618,11 @@ export async function buy(
         "Automatic payment blocked because the resource price could not be determined; no x402 payment was submitted.",
       );
     }
-    assertAutoPaymentWithinCeiling({ price: meta.data.price, maxAutoPayUsdc });
+    const previewPrice = String(meta.data.price);
+    const approvedPrice = estimatedPrice ?? previewPrice;
+    assertAutoPaymentWithinCeiling({ price: approvedPrice, maxAutoPayUsdc });
     return JSON.stringify(
-      dryRunBuy(resourceId, NETWORK, BASE_URL, !!activeProfile().wallet, String(meta.data.price)),
+      dryRunBuy(resourceId, NETWORK, BASE_URL, !!activeProfile().wallet, previewPrice),
       null,
       2,
     );
@@ -3306,7 +3308,10 @@ export async function setListed(resourceId: string, listed: boolean): Promise<st
 
 export async function setTags(resourceId: string, tags: string[]): Promise<string> {
   const wallet = requireWallet();
-  if (_isMock()) return mockSetTags(resourceId, tags);
+  const normalizedTags = Array.from(
+    new Set(tags.map((tag) => tag.trim().toLowerCase()).filter(Boolean)),
+  );
+  if (_isMock()) return mockSetTags(resourceId, normalizedTags);
 
   const client = createRegistryClient({
     contractId: REGISTRY_CONTRACT_ID,
@@ -3317,7 +3322,7 @@ export async function setTags(resourceId: string, tags: string[]): Promise<strin
 
   let tx: Awaited<ReturnType<typeof client.set_tags>>;
   try {
-    tx = await client.set_tags({ id: resourceId, tags });
+    tx = await client.set_tags({ id: resourceId, tags: normalizedTags });
   } catch (err: any) {
     if (isTimeoutError(err)) {
       throw mcpError(
@@ -3373,7 +3378,7 @@ export async function setTags(resourceId: string, tags: string[]): Promise<strin
   const txHash = sentTx?.sendTransactionResponse?.hash ?? null;
   return [
     `Tags updated for resource "${resourceId}".`,
-    `Tags: ${tags.length > 0 ? tags.join(", ") : "(none)"}`,
+    `Tags: ${normalizedTags.length > 0 ? normalizedTags.join(", ") : "(none)"}`,
     `Tx hash: ${txHash ?? "pending"}`,
   ].join("\n");
 }
