@@ -11530,6 +11530,7 @@ include!("test/royalty_floor_validation.rs");
 include!("test/anchor_failure_events.rs");
 include!("test/admin_bootstrap_replay.rs");
 include!("test/duplicate_receipt_buyer_normalization.rs");
+include!("test/x402_settle_anchor_integration.rs");
 include!("test/batch_owner_and_ordered_reads.rs");
 include!("test/resale_royalty.rs");
 include!("test/verifier_rotation.rs");
