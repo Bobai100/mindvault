@@ -11526,3 +11526,5 @@ include!("test/anchor_backoff.rs");
 include!("test/fee_rounding_proptest.rs");
 include!("test/storage_ttl_mutations.rs");
 include!("test/payment_pause_matrix.rs");
+include!("test/batch_owner_and_ordered_reads.rs");
+include!("test/resale_royalty.rs");
